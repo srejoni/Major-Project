@@ -1,0 +1,146 @@
+Step 1: Install Dependencies & Generate Dynamic Labels
+!pip install -U ultralytics pydicom
+
+import os
+import pandas as pd
+import pydicom
+
+# --- CRITICAL: VERIFY THIS PATH IN YOUR KAGGLE SIDEBAR ---
+INPUT_BASE_DIR = "/kaggle/input/rsna-2024-lumbar-spine-degenerative-classification"
+# ---------------------------------------------------------
+
+CSV_PATH = os.path.join(INPUT_BASE_DIR, "train_label_coordinates.csv")
+DICOM_DIR = os.path.join(INPUT_BASE_DIR, "train_images")
+LBL_TRAIN_DIR = "/kaggle/working/PDSCD/datasets/yolo_format/labels/train"
+
+os.makedirs(LBL_TRAIN_DIR, exist_ok=True)
+level_to_id = {"L1/L2": 0, "L2/L3": 1, "L3/L4": 2, "L4/L5": 3, "L5/S1": 4}
+BOX_SIZE = 50.0
+
+df = pd.read_csv(CSV_PATH)
+grouped = df.groupby(['study_id', 'series_id', 'instance_number'])
+
+files_created = 0
+print("Generating dynamically normalized labels...")
+
+for (study, series, instance), group in grouped:
+    lbl_path = os.path.join(LBL_TRAIN_DIR, f"{study}_{series}_{instance}.txt")
+    dcm_path = os.path.join(DICOM_DIR, str(study), str(series), f"{instance}.dcm")
+    
+    if not os.path.exists(dcm_path): continue
+        
+    # Read ONLY header for speed
+    ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+    native_w, native_h = float(ds.Columns), float(ds.Rows)
+    
+    # Calculate perfectly relative box dimensions
+    norm_w = BOX_SIZE / native_w
+    norm_h = BOX_SIZE / native_h
+    
+    with open(lbl_path, 'w') as f:
+        for _, row in group.iterrows():
+            if row['level'] in level_to_id:
+                cid = level_to_id[row['level']]
+                cx = max(0.0, min(1.0, row['x'] / native_w))
+                cy = max(0.0, min(1.0, row['y'] / native_h))
+                f.write(f"{cid} {cx:.6f} {cy:.6f} {norm_w:.6f} {norm_h:.6f}\n")
+    files_created += 1
+
+print(f"Success! {files_created} accurate label files generated.")
+
+
+
+Step 2: Inject Stats & Extract YOLO Images
+import json
+import shutil
+import cv2
+import numpy as np
+
+IMG_TRAIN_DIR = "/kaggle/working/PDSCD/datasets/yolo_format/images/train"
+IMG_VAL_DIR = "/kaggle/working/PDSCD/datasets/yolo_format/images/val"
+LBL_VAL_DIR = "/kaggle/working/PDSCD/datasets/yolo_format/labels/val"
+STATS_DIR = "/kaggle/working/PDSCD/configs/splits/stats"
+STATS_PATH = os.path.join(STATS_DIR, "global_dataset_stats.json")
+
+os.makedirs(IMG_TRAIN_DIR, exist_ok=True)
+os.makedirs(IMG_VAL_DIR, exist_ok=True)
+os.makedirs(LBL_VAL_DIR, exist_ok=True)
+os.makedirs(STATS_DIR, exist_ok=True)
+
+# Inject Stats (UPDATE THESE NUMBERS)
+if not os.path.exists(STATS_PATH):
+    global_stats = {"global_mean": 0.0, "global_std": 0.0} 
+    with open(STATS_PATH, 'w') as f:
+        json.dump(global_stats, f, indent=4)
+
+with open(STATS_PATH, 'r') as f:
+    stats = json.load(f)
+    g_mean, g_std = stats['global_mean'], stats['global_std']
+
+# Split deterministically
+studies = df['study_id'].unique()
+np.random.seed(42)
+np.random.shuffle(studies)
+train_studies = set(studies[:int(len(studies) * 0.8)])
+
+processed = 0
+print("Extracting and normalizing images...")
+
+for (study, series, instance), _ in grouped:
+    is_train = study in train_studies
+    target_img = IMG_TRAIN_DIR if is_train else IMG_VAL_DIR
+    
+    dcm_path = os.path.join(DICOM_DIR, str(study), str(series), f"{instance}.dcm")
+    png_path = os.path.join(target_img, f"{study}_{series}_{instance}.png")
+    old_lbl = os.path.join(LBL_TRAIN_DIR, f"{study}_{series}_{instance}.txt")
+    new_lbl = os.path.join(LBL_VAL_DIR, f"{study}_{series}_{instance}.txt")
+    
+    # Route label
+    if not is_train and os.path.exists(old_lbl) and not os.path.exists(new_lbl):
+        shutil.move(old_lbl, new_lbl)
+        
+    # Extract image
+    if not os.path.exists(png_path) and os.path.exists(dcm_path):
+        arr = pydicom.dcmread(dcm_path).pixel_array.astype(np.float32)
+        norm = (arr - g_mean) / g_std
+        clipped = ((np.clip(norm, -3.0, 3.0) + 3.0) / 6.0) * 255.0
+        cv2.imwrite(png_path, clipped.astype(np.uint8))
+        processed += 1
+
+print(f"Extraction complete! {processed} images securely routed.")
+
+
+
+Step 3: Configure & Train YOLOv8
+import yaml
+from ultralytics import YOLO
+
+YAML_PATH = "/kaggle/working/PDSCD/configs/yolo_data.yaml"
+MODEL_DIR = "/kaggle/working/PDSCD/models/localization"
+os.makedirs(os.path.dirname(YAML_PATH), exist_ok=True)
+
+yolo_config = {
+    "path": "/kaggle/working/PDSCD/datasets/yolo_format",
+    "train": "images/train",
+    "val": "images/val",
+    "nc": 5,
+    "names": ["L1-L2", "L2-L3", "L3-L4", "L4-L5", "L5-S1"]
+}
+
+with open(YAML_PATH, 'w') as f:
+    yaml.dump(yolo_config, f, default_flow_style=False)
+
+# Train the network on the corrected labels
+model = YOLO('yolov8n.pt')
+results = model.train(
+    data=YAML_PATH, 
+    epochs=20, 
+    imgsz=512, 
+    batch=16, 
+    project=MODEL_DIR, 
+    name="yolo_run", 
+    exist_ok=True
+)
+
+weights_path = os.path.join(MODEL_DIR, 'yolo_run', 'weights', 'best.pt')
+print(f"Pipeline Finished. Accurate weights saved securely at: {weights_path}")
