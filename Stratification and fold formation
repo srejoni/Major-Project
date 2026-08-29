@@ -1,0 +1,98 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+RSNA_ROOT = "/kaggle/input/competitions/rsna-2024-lumbar-spine-degenerative-classification"
+TRAIN_CSV = os.path.join(RSNA_ROOT, "train.csv")
+OUT_DIR = "splits"  # save under /kaggle/working/splits, then commit to /configs/
+os.makedirs(OUT_DIR, exist_ok=True)
+TEST_SIZE = 0.15
+N_FOLDS = 4
+RANDOM_STATE = 42
+SEVERITY_MAP = {
+    "Normal/Mild": 0,
+    "Moderate": 1,
+    "Severe": 2,
+}
+REPO_SPLITS_PATH = "/kaggle/working/PDSCD/configs/splits/locked_test_ids.csv"  # adjust to your clone path
+
+if os.path.exists(REPO_SPLITS_PATH) and "FORCE_RESPLIT" not in os.environ:
+    print("Canonical split already exists in the repo's configs/splits/ — "
+          "skipping regeneration, using the existing committed split.")
+    SKIP_SPLIT_GENERATION = True
+else:
+    SKIP_SPLIT_GENERATION = False
+
+if not SKIP_SPLIT_GENERATION:
+    df = pd.read_csv(TRAIN_CSV)
+    id_col = "study_id"
+    condition_cols = [c for c in df.columns if c != id_col]
+    severity_numeric = df[condition_cols].replace(SEVERITY_MAP)
+    severity_numeric = severity_numeric.apply(pd.to_numeric, errors="coerce")
+    df["worst_severity"] = severity_numeric.max(axis=1)
+
+    missing_mask = df["worst_severity"].isna()if missing_mask.any():
+        print(f"WARNING: {missing_mask.sum()} patients have no usable severity "
+              f"label and will be excluded from stratified splitting.")
+        df.loc[missing_mask, ["study_id"]].to_csv(
+            os.path.join(OUT_DIR, "excluded_no_label.csv"), index=False
+        )
+
+    df_valid = df.loc[~missing_mask, [id_col, "worst_severity"]].copy()
+    df_valid["worst_severity"] = df_valid["worst_severity"].astype(int)
+    print(f"Total patients: {len(df)} | usable for stratified split: {len(df_valid)}")
+    print("Severity distribution:\n", df_valid["worst_severity"].value_counts().sort_index())
+
+    remaining_ids, test_ids = train_test_split(
+        df_valid[id_col],
+        test_size=TEST_SIZE,
+        stratify=df_valid["worst_severity"],
+        random_state=RANDOM_STATE,
+    )test_ids = test_ids.reset_index(drop=True)
+    remaining_ids = remaining_ids.reset_index(drop=True)
+    test_ids.to_csv(os.path.join(OUT_DIR, "locked_test_ids.csv"), index=False, header=["study_id"])
+    print(f"\nLocked test set: {len(test_ids)} patients -> {OUT_DIR}/locked_test_ids.csv")
+    print("This file must be committed to the repo and NEVER regenerated.")
+
+    remaining_df = df_valid[df_valid[id_col].isin(remaining_ids)].reset_index(drop=True)
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    fold_summary = []
+    for fold_idx, (train_pos, val_pos) in enumerate(
+        skf.split(remaining_df[id_col], remaining_df["worst_severity"]), start=1
+    ):
+        train_ids_fold = remaining_df.loc[train_pos, id_col].reset_index(drop=True)
+        val_ids_fold = remaining_df.loc[val_pos, id_col].reset_index(drop=True)
+        train_ids_fold.to_csv(
+            os.path.join(OUT_DIR, f"fold{fold_idx}_train_ids.csv"), index=False, header=["study_id"]
+        )
+        val_ids_fold.to_csv(
+            os.path.join(OUT_DIR, f"fold{fold_idx}_val_ids.csv"), index=False, header=["study_id"]
+        )
+        fold_summary.append(
+            {"fold": fold_idx, "n_train": len(train_ids_fold), "n_val": len(val_ids_fold)}
+        )
+        print(f"Fold {fold_idx}: train={len(train_ids_fold)}, val={len(val_ids_fold)} "
+              f"-> {OUT_DIR}/fold{fold_idx}_train_ids.csv / fold{fold_idx}_val_ids.csv")
+
+    print("\nSummary:")
+    print(pd.DataFrame(fold_summary))
+
+    all_test = set(test_ids)
+    for fold_idx in range(1, N_FOLDS + 1):
+        tr = set(pd.read_csv(os.path.join(OUT_DIR, f"fold{fold_idx}_train_ids.csv"))["study_id"])
+        va = set(pd.read_csv(os.path.join(OUT_DIR, f"fold{fold_idx}_val_ids.csv"))["study_id"])
+        assert tr.isdisjoint(va), f"Fold {fold_idx}: train/val overlap!"
+        assert tr.isdisjoint(all_test), f"Fold {fold_idx}: train overlaps locked test set!"
+        assert va.isdisjoint(all_test), f"Fold {fold_idx}: val overlaps locked test set!"
+    print("\nAll disjointness checks passed: no patient leakage between "
+          "locked test set and any fold's train/val.")
+
+    n_rows = len(df) n_unique_patients = df[id_col].nunique()
+    assert n_rows == n_unique_patients, (
+        f"train.csv has {n_rows} rows but only {n_unique_patients} unique "
+        f"study_ids - patients are duplicated in train.csv itself, "
+        f"investigate before trusting the split."
+    )
+    print(f"\ntrain.csv check: {n_rows} rows == {n_unique_patients} unique "
+          f"patients. No duplicate patient rows in the severity table.")
