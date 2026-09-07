@@ -1,0 +1,210 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://pdscd.internal/schemas/pdscd_output_schema_v1.0.0.json",
+  "title": "PDSCD Ensemble Output (v1.0.0)",
+  "description": "Per-study output of the PDSCD imaging ensemble, consumed by the LLM integration hardcoded-rules layer.",
+  "type": "object",
+  "required": [
+    "schema_version", "study_id", "generated_at", "pipeline_version",
+    "model_versions", "ensemble_method", "study_summary", "predictions"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "study_id": { "type": "integer" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "pipeline_version": { "type": "string" },
+    "model_versions": {
+      "type": "object",
+      "required": ["efficientnet_b3", "convnext_tiny", "resnet34"],
+      "properties": {
+        "efficientnet_b3": { "type": "string" },
+        "convnext_tiny": { "type": "string" },
+        "resnet34": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "ensemble_method": {
+      "type": "object",
+      "required": ["type", "weights"],
+      "properties": {
+        "type": { "type": "string", "enum": ["soft_probability_averaging", "weighted_average", "majority_vote"] },
+        "weights": {
+          "type": "object",
+          "required": ["efficientnet_b3", "convnext_tiny", "resnet34"],
+          "properties": {
+            "efficientnet_b3": { "type": "number", "minimum": 0, "maximum": 1 },
+            "convnext_tiny": { "type": "number", "minimum": 0, "maximum": 1 },
+            "resnet34": { "type": "number", "minimum": 0, "maximum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "note": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "study_summary": {
+      "type": "object",
+      "required": ["highest_severity_code", "highest_severity_label", "severity_counts", "missing_prediction_count", "low_confidence_count"],
+      "properties": {
+        "highest_severity_code": { "type": ["integer", "null"], "enum": [0, 1, 2, null] },
+        "highest_severity_label": { "type": ["string", "null"], "enum": ["Normal/Mild", "Moderate", "Severe", null] },
+        "severity_counts": {
+          "type": "object",
+          "required": ["Normal/Mild", "Moderate", "Severe"],
+          "properties": {
+            "Normal/Mild": { "type": "integer", "minimum": 0 },
+            "Moderate": { "type": "integer", "minimum": 0 },
+            "Severe": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "missing_prediction_count": { "type": "integer", "minimum": 0, "maximum": 25 },
+        "low_confidence_count": { "type": "integer", "minimum": 0, "maximum": 25 }
+      },
+      "additionalProperties": false
+    },
+    "predictions": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "items": { "$ref": "#/definitions/prediction" }
+    }
+  },
+  "additionalProperties": false,
+
+  "definitions": {
+    "condition": {
+      "type": "string",
+      "enum": [
+        "spinal_canal_stenosis",
+        "left_neural_foraminal_narrowing",
+        "right_neural_foraminal_narrowing",
+        "left_subarticular_stenosis",
+        "right_subarticular_stenosis"
+      ]
+    },
+    "level": {
+      "type": "string",
+      "enum": ["L1/L2", "L2/L3", "L3/L4", "L4/L5", "L5/S1"]
+    },
+    "probabilities": {
+      "type": "object",
+      "required": ["normal_mild", "moderate", "severe"],
+      "properties": {
+        "normal_mild": { "type": "number", "minimum": 0, "maximum": 1 },
+        "moderate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "severe": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "model_vote": {
+      "type": "object",
+      "required": ["severity_code", "probabilities"],
+      "properties": {
+        "severity_code": { "type": "integer", "enum": [0, 1, 2] },
+        "probabilities": { "$ref": "#/definitions/probabilities" }
+      },
+      "additionalProperties": false
+    },
+    "prediction": {
+      "type": "object",
+      "required": ["condition", "level", "status", "severity_code", "severity_label",
+                   "confidence", "probabilities", "competition_weight",
+                   "model_votes", "model_agreement", "source"],
+      "properties": {
+        "condition": { "$ref": "#/definitions/condition" },
+        "level": { "$ref": "#/definitions/level" },
+        "status": {
+          "type": "string",
+          "enum": ["ok", "missing_detection", "missing_label", "duplicate_resolved"]
+        },
+        "severity_code": { "type": ["integer", "null"], "enum": [0, 1, 2, null] },
+        "severity_label": { "type": ["string", "null"], "enum": ["Normal/Mild", "Moderate", "Severe", null] },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "probabilities": {
+          "oneOf": [
+            { "$ref": "#/definitions/probabilities" },
+            { "type": "null" }
+          ]
+        },
+        "competition_weight": { "type": "integer", "enum": [1, 2, 4] },
+        "model_votes": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["efficientnet_b3", "convnext_tiny", "resnet34"],
+              "properties": {
+                "efficientnet_b3": { "$ref": "#/definitions/model_vote" },
+                "convnext_tiny": { "$ref": "#/definitions/model_vote" },
+                "resnet34": { "$ref": "#/definitions/model_vote" }
+              },
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        },
+        "model_agreement": {
+          "type": ["string", "null"],
+          "enum": ["unanimous_3_of_3", "majority_2_of_3", "split_no_majority", null]
+        },
+        "source": {
+          "type": "object",
+          "required": ["series_description", "n_slices_used", "yolo_detection_confidence"],
+          "properties": {
+            "series_description": {
+              "type": ["string", "null"],
+              "enum": ["Sagittal T1", "Sagittal T2/STIR", "Axial T2", null]
+            },
+            "n_slices_used": { "type": ["integer", "null"], "enum": [1, 3, null] },
+            "yolo_detection_confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "ok" } } },
+          "then": {
+            "properties": {
+              "severity_code": { "type": "integer" },
+              "severity_label": { "type": "string" },
+              "confidence": { "type": "number" },
+              "probabilities": { "type": "object" },
+              "model_votes": { "type": "object" },
+              "model_agreement": { "type": "string" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "duplicate_resolved" } } },
+          "then": {
+            "comment": "Per pdscd_output_format.md §5: duplicate_resolved is a resolved data-quality note, not an active problem -- 'treat like ok.' Previously this status had no enforced branch here, so an entry could carry status='duplicate_resolved' with every prediction field null and still pass validation, silently breaking that promise. This branch closes that gap by requiring the same real, non-null fields 'ok' requires.",
+            "properties": {
+              "severity_code": { "type": "integer" },
+              "severity_label": { "type": "string" },
+              "confidence": { "type": "number" },
+              "probabilities": { "type": "object" },
+              "model_votes": { "type": "object" },
+              "model_agreement": { "type": "string" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "missing_detection" } } },
+          "then": {
+            "properties": {
+              "severity_code": { "type": "null" },
+              "severity_label": { "type": "null" },
+              "confidence": { "type": "null" },
+              "probabilities": { "type": "null" },
+              "model_votes": { "type": "null" },
+              "model_agreement": { "type": "null" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
