@@ -1,17 +1,37 @@
 """
 classification/train.py
 
-Training loop for the basic model, fixing the per-target class-weighting
-issue, PLUS two throughput accelerations for this T4x2 environment:
-  1. nn.DataParallel across both GPUs when more than one is available --
-     the session was observed running at 94%/0% GPU utilization on the two
-     T4s, meaning only one was ever actually used.
-  2. Automatic mixed precision (torch.cuda.amp) -- T4s have strong FP16
-     tensor cores; this was previously running in full FP32.
+Training loop for the basic model. Adds overfitting countermeasures on top
+of the existing class-weighting fix and DataParallel/AMP acceleration:
 
-Neither change affects the class-weighting fix, the per-condition eval
-breakdown, or the loss-weighting sanity check below -- all unchanged from
-the previous version.
+  1. Weight decay (AdamW's built-in L2 penalty) -- discourages large
+     weights, directly targets memorization.
+  2. Label smoothing (0.1) on the training loss -- softens hard 0/1
+     targets so the model isn't rewarded for overconfident wrong-direction
+     predictions. IMPORTANT: this is applied via a SEPARATE criterion from
+     the one used in verify_loss_weighting()'s sanity check below. Label
+     smoothing makes even a perfect, fully-confident prediction produce a
+     small non-zero loss (because the smoothed target is never a true
+     one-hot), so running the sanity check's near-zero-loss assertion
+     against a label-smoothed criterion would fail for the wrong reason
+     and mask a real bug if one ever occurred. The sanity check keeps
+     validating weighting mechanics only, exactly as before; smoothing is
+     layered on afterward, at the actual training criterion, deliberately
+     kept as two objects.
+  3. ReduceLROnPlateau scheduler keyed on val_loss -- previously a fixed
+     LR for all 10 epochs. This was very likely a real contributor to the
+     val_loss oscillation observed (0.548 -> 0.577 -> 0.568 -> 0.592 -> ...)
+     rather than a smooth climb: a fixed LR that was fine for early-epoch
+     progress can be too large once the loss surface flattens out, causing
+     it to bounce around a minimum instead of settling into it.
+  4. Early stopping (patience=3 epochs on val_loss) -- stops the run once
+     val_loss hasn't improved on the best-seen value for 3 consecutive
+     epochs, instead of always running the full fixed NUM_EPOCHS. The
+     `if val_loss < best_val_loss` checkpoint logic is unchanged and still
+     the source of truth for which weights get saved.
+
+Neither DataParallel, AMP, the class-weighting fix, nor the per-condition
+eval breakdown are touched -- all unchanged from the previous version.
 
 Model architecture note: no classification/model.py has been shared into
 this conversation, so this script builds a standard EfficientNetB3
@@ -30,6 +50,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
 
 sys.path.append("/kaggle/working/PDSCD")
@@ -42,6 +63,11 @@ CHECKPOINT_DIR = "/kaggle/working/checkpoints"
 NUM_EPOCHS = 10
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+LABEL_SMOOTHING = 0.1
+EARLY_STOPPING_PATIENCE = 3  # epochs with no val_loss improvement before stopping
+LR_SCHEDULER_PATIENCE = 1    # epochs with no val_loss improvement before LR is halved
+LR_SCHEDULER_FACTOR = 0.5
 
 # Fixed competition severity weights. class idx 0/1/2 = normal-mild/
 # moderate/severe. Applied identically to every batch, regardless of which
@@ -82,7 +108,17 @@ def verify_loss_weighting(device):
     sum-of-weights-in-batch, not sample count) before this script existed.
     This is a cheap smoke test that fails loudly if the environment/PyTorch
     version ever changes that behavior -- it does not re-derive the original
-    validation, which already happened separately."""
+    validation, which already happened separately.
+
+    Deliberately uses NO label smoothing here, even though the actual
+    training criterion (built in main()) does. Label smoothing changes what
+    "near-zero loss for a confident correct prediction" means -- with
+    smoothing on, even a perfect prediction has a non-zero floor loss from
+    the smoothed target distribution. Testing weighting mechanics and
+    testing smoothing behavior are two different concerns; keeping this
+    criterion unsmoothed means a real weighting regression still fails
+    loudly and specifically, instead of being masked by or confused with
+    smoothing's expected non-zero floor."""
     weights = SEVERITY_CLASS_WEIGHTS.to(device)
     criterion = nn.CrossEntropyLoss(weight=weights, reduction="mean")
 
@@ -99,6 +135,19 @@ def verify_loss_weighting(device):
         f"this is understood."
     )
     print(f"[train] loss-weighting sanity check passed (loss={loss:.6f})")
+    return criterion
+
+
+def build_training_criterion(device):
+    """The actual criterion used for backprop -- same class weights as the
+    sanity-checked one above, plus label smoothing layered on top. Kept as
+    a separate object from verify_loss_weighting()'s criterion (see that
+    function's docstring for why)."""
+    weights = SEVERITY_CLASS_WEIGHTS.to(device)
+    criterion = nn.CrossEntropyLoss(
+        weight=weights, reduction="mean", label_smoothing=LABEL_SMOOTHING
+    )
+    print(f"[train] training criterion built with label_smoothing={LABEL_SMOOTHING}")
     return criterion
 
 
@@ -130,7 +179,13 @@ def evaluate(model, loader, criterion, device):
     training instead of staying hidden inside one aggregate number. This
     breakdown is diagnostic only; it does not change the loss weighting.
     Forward passes also run under autocast for the same throughput benefit;
-    no scaler is needed here since there's no backward pass."""
+    no scaler is needed here since there's no backward pass.
+
+    NOTE: evaluate() uses the SAME (label-smoothed) criterion as training,
+    intentionally -- val_loss must be measured on the same loss surface the
+    optimizer is actually descending, or "best val_loss" checkpointing
+    would be comparing numbers that aren't apples-to-apples with what
+    training is optimizing against."""
     model.eval()
     total_loss, n_batches = 0.0, 0
     correct, total = 0, 0
@@ -169,30 +224,61 @@ def main():
     print(f"[train] device={device}")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    criterion = verify_loss_weighting(device)
+    # Sanity check runs on its own unsmoothed criterion -- see docstring.
+    verify_loss_weighting(device)
+    # Actual training/eval criterion, with label smoothing.
+    criterion = build_training_criterion(device)
+
     train_loader, val_loader = build_classification_dataloaders(
         MANIFEST_PATH, batch_size=BATCH_SIZE
     )
 
     model = build_model(device)
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="min", factor=LR_SCHEDULER_FACTOR, patience=LR_SCHEDULER_PATIENCE
+    )
     scaler = torch.cuda.amp.GradScaler()
 
+    print(f"[train] weight_decay={WEIGHT_DECAY}  "
+          f"early_stopping_patience={EARLY_STOPPING_PATIENCE}  "
+          f"lr_scheduler_patience={LR_SCHEDULER_PATIENCE}  "
+          f"lr_scheduler_factor={LR_SCHEDULER_FACTOR}")
+
     best_val_loss = float("inf")
+    epochs_without_improvement = 0
+
     for epoch in range(1, NUM_EPOCHS + 1):
         start = time.time()
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         elapsed = time.time() - start
 
+        current_lr = optimizer.param_groups[0]["lr"]
         print(f"[epoch {epoch}/{NUM_EPOCHS}] train_loss={train_loss:.4f}  "
-              f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}  ({elapsed:.1f}s)")
+              f"val_loss={val_loss:.4f}  val_acc={val_acc:.4f}  lr={current_lr:.2e}  "
+              f"({elapsed:.1f}s)")
+
+        scheduler.step(val_loss)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             ckpt_path = os.path.join(CHECKPOINT_DIR, "efficientnet_b3_best.pt")
             torch.save(unwrap_model(model).state_dict(), ckpt_path)
             print(f"[train] new best val_loss={val_loss:.4f} -- saved {ckpt_path}")
+        else:
+            epochs_without_improvement += 1
+            print(f"[train] no improvement for {epochs_without_improvement} "
+                  f"epoch(s) (best={best_val_loss:.4f})")
+            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+                print(f"[train] early stopping -- no val_loss improvement for "
+                      f"{EARLY_STOPPING_PATIENCE} consecutive epochs. Best "
+                      f"checkpoint (val_loss={best_val_loss:.4f}) remains at "
+                      f"{os.path.join(CHECKPOINT_DIR, 'efficientnet_b3_best.pt')}.")
+                break
+
+    print(f"[train] training complete. best_val_loss={best_val_loss:.4f}")
 
 
 if __name__ == "__main__":
