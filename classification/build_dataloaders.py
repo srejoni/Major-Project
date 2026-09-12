@@ -103,10 +103,10 @@ def _resolve_crop_root(sample_path: str) -> str:
     when both exist.
     """
     candidates = [
-        "/kaggle/working/classification_data",
-        "/kaggle/working/PDSCD/classification_data",
-        "/kaggle/input/datasets/srejoni/crop-extraction/classification_data",
-    ]
+    "/kaggle/working/classification_data",
+    "/kaggle/working/PDSCD/classification_data",
+    "/kaggle/input/datasets/elenoremadams/crop-extraction/classification_data",
+]
     tail = sample_path.split("classification_data", 1)[-1]
     for root in candidates:
         if os.path.exists(root + tail):
