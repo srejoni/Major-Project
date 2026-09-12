@@ -58,7 +58,7 @@ from classification.build_dataloaders import build_classification_dataloaders
 
 # Confirmed mount from the crop-extraction dataset check -- update if this
 # ever moves.
-MANIFEST_PATH = "/kaggle/input/datasets/srejoni/crop-extraction/classification_data/manifest.csv"
+MANIFEST_PATH = "/kaggle/input/datasets/elenoremadams/crop-extraction/classification_data/manifest.csv"
 CHECKPOINT_DIR = "/kaggle/working/checkpoints"
 NUM_EPOCHS = 10
 BATCH_SIZE = 16
