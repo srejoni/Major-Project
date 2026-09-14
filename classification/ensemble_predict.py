@@ -26,6 +26,17 @@ resolves it -- matching the same pattern verify_paths.py already
 established elsewhere in this project -- rather than surfacing a bare
 FileNotFoundError from deep inside torch.
 
+NOTE (checkpoint freshness, not a code bug -- a data/process one):
+this file's correctness depends on classification/weights/efficientnet_b3_best.pt
+actually being the checkpoint from the latest completed train.py run under
+all current fixes (merge-logic refactor + crop-root fix + overfitting
+countermeasures). Because load_models() only checks that a file exists at
+this path, not which training run produced it, silently overwriting this
+path with a stale checkpoint would NOT raise any error here -- it would
+just quietly serve outdated predictions. Confirm the physical .pt file at
+this path has actually been replaced and pushed after every new training
+run, before trusting output from this module.
+
 BLOCKER, NOT WORKED AROUND (unchanged): pdscd_output_schema.json requires
 model_versions and model_votes to contain all three of efficientnet_b3,
 convnext_tiny, resnet34 (additionalProperties: false). Only
