@@ -120,7 +120,7 @@ CONDITIONS = list(SERIES_BY_CONDITION.keys())
 # default and the import-time contract check below both read this, so they cannot
 # point at different files (the schema filename already drifted once across $id,
 # the file on disk and the code default). Anchored to this file, not the cwd.
-SCHEMA_PATH = Path(__file__).resolve().parents[1] / "pdscd_output_schema.json"
+SCHEMA_PATH = Path(__file__).resolve().parents[1] / "classification"/"pdscd_output_schema.json"
 
 # T3-5: fail at import, loudly, if the export's structural constants drift from
 # the schema. Raises ContractError (an explicit raise, so `python -O` cannot strip it).
